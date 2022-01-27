@@ -1,0 +1,643 @@
+---
+title: "Clustering sistemas de salud LA"
+output: html_document
+---
+
+```{r message = F, warning=F, include=F}
+rm(list = ls())
+
+knitr::opts_chunk$set(message = F,
+                      warning = F, echo = F)
+
+library(tidyverse)
+library(data.table)
+library(factoextra)
+library(cluster)
+library(table1)
+library(fpc)
+library(dendextend)
+library(ggpubr)
+```
+
+# Datos
+
+```{r lista de paises}
+countries <- c("ATG", "ARG", "BHS", "BRB", "BLZ", "BOL", "BRA", "CHL", "COL", 
+               "CRI", "CUB", "DMA", "DOM", "ECU", "SLV", "GRD", "GTM", "GUY",
+               "HTI", "HND", "JAM", "MEX", "NIC", "PAN", "PRY", "PER", "KNA", 
+               "LCA", "VCT", "SUR", "TTO", "URY", "VEN")
+```
+
+```{r datos GHED}
+# setwd("C:/Users/Usuario/Dropbox/Trabajo/CEPAL Sist Salud")
+
+dat <- as.data.table(readxl::read_excel(path = "GHED_data.XLSX"))
+
+dat.ghed <- dat %>% 
+  filter(`region (WHO)` == "AMR") %>% 
+  filter(!(country %in% c("Canada", "United States of America"))) %>% 
+  select(country, `country code`, `income group`, year,
+         che_gdp, #Aggregates
+         fs1, fs2, fs3, gdp, gge, 
+         gghed_che, gghed_gdp, tran_shi, pvtd_che, oops_che, #FS
+         cfa_che, gfa_che, chi_che, #HF
+         phc_che, gghed_phc_gghed, gghed_phc_phc, # PHC;falta GGHE_phc%GDP
+         
+         ) %>% 
+  mutate(gghe_gdp = ((fs1+fs2+fs3)/gdp)*100,
+         gghe_gge = ((fs1+fs2+fs3)/gge)*100) %>% 
+  select(-fs1, -fs2, -fs3, -gdp, -gge ) %>% 
+  rename(country.code = `country code`) %>% 
+  rename(income.group = `income group`)
+
+rm(dat)
+```
+
+```{r datos BM}
+# path <- "C:/Users/sflor/Dropbox/Trabajo/CEPAL Sist Salud"
+
+# path <- "C:/Users/Usuario/Dropbox/Trabajo/CEPAL Sist Salud"
+
+#setwd(path)
+
+path <- getwd()
+
+files <- list.files(path = path, pattern = c("BM "))
+
+dat_now <- data.table()
+
+for (i in 1:length(files)) {
+  dat_temp <- fread(file = paste0(path, "/", files[i]), header = T)[
+    `Country Code` %in% countries ]
+  
+  ind <- dat_temp$`Indicator Code` %>% unique()
+  
+  dat_temp <- dat_temp %>% 
+    select(-`Country Name`, -`Indicator Name`, -`Indicator Code`) %>% 
+    pivot_longer(names_to = "Year",
+                 values_to = ind,
+                 cols = -c(`Country Code`))
+  
+  if (nrow(dat_now) == 0) {
+    dat_now <- dat_temp
+  } else {
+    dat_now <- full_join(dat_now, dat_temp)    
+  }
+
+}
+
+dat.bm <- dat_now %>% 
+  mutate(Year = as.numeric(Year)) %>% 
+  rename(country.code = `Country Code`) %>% 
+  rename(year = Year)
+
+rm(dat_now, dat_temp, files, i, ind, path)
+```
+
+##  
+
+```{r datos unir GHED y BM}
+dat <- full_join(dat.ghed, dat.bm, by = c("country.code", "year"))
+
+d.country <- dat %>% 
+  select(country, country.code, income.group) %>% unique() %>% na.omit() 
+
+dat <- left_join(dat %>% select(-country, -income.group), d.country, by = "country.code")
+```
+
+```{r datos agregar CEPAL medicos y camas}
+d.meds <- as.data.table(readxl::read_excel(path = "CEPAL medicos 10mil.xlsx"))[
+  , .(year = as.numeric(Años__ESTANDAR), country = País__ESTANDAR, Meds_10mil = value/10) ]
+d.beds <- as.data.table(readxl::read_excel(path = "CEPAL camas 10mil.xlsx"))[
+  , .(year = as.numeric(Años__ESTANDAR), country = País__ESTANDAR, Camas_10mil = value/10) ]
+
+dat <- full_join(d.meds, d.beds, by = c("country", "year")) %>% 
+  filter(country != "América Latina y el Caribe") %>% 
+  mutate(country = factor(country, labels = c("Antigua and Barbuda", "Argentina", "Bahamas", 
+                                              "Barbados", "Belize", "Bolivia Plurinational States of", 
+                                              "Brazil", "Chile", "Colombia", 
+                                              "Costa Rica", "Cuba", "Dominica", 
+                                              "Ecuador", "El Salvador", "Grenada", 
+                                              "Guatemala", "Guyana", "Haiti", 
+                                              "Honduras", "Jamaica", "Mexico", 
+                                              "Nicaragua", "Panama", "Paraguay", 
+                                              "Peru", "Dominican Republic","Saint Kitts and Nevis", 
+                                              "Saint Vincent and the Grenadines", "Saint Lucia", "Suriname", 
+                                              "Trinidad and Tobago", "Uruguay", 
+                                              "Venezuela (Bolivarian Republic of)"))) %>%  
+  full_join(d.country, by = "country") %>% 
+  select(-country) %>% 
+  full_join(dat, by = c("country.code", "year", "income.group")) %>% 
+  group_by(country, year, country.code) %>% 
+  mutate(SH.MED.BEDS.ZS = mean(c(SH.MED.BEDS.ZS, Camas_10mil), na.rm = T),
+         SH.MED.PHYS.ZS = mean(c(SH.MED.PHYS.ZS, Meds_10mil), na.rm = T)) %>% 
+  ungroup() %>% 
+  select(-Camas_10mil, -Meds_10mil)
+
+rm(d.meds, d.beds, dat.bm, dat.ghed) 
+```
+
+```{r datos agregar cobertura}
+d.cov <- fread("Cobertura contributiva_con agregados.csv",
+               select = c("country", "country.code", "year", "coverage"),
+               dec = ",")
+
+dat <- full_join(dat, d.cov, by = c("country", "country.code", "year"))
+
+rm(d.cov)
+```
+
+```{r datos agregar gasto}
+d.gas <- fread("Gasto CELAC.csv")
+
+dat <- full_join(dat, d.gas, by = c("country", "country.code"))
+
+rm(d.gas)
+```
+
+```{r GUARDAR CONJUNTO DE DATOS COMPLETO, eval = F}
+write.csv2(dat, "DATOS COMPLETOS.csv")
+```
+
+
+```{r eval=F}
+dat %>% 
+  select(country, country.code) %>% unique %>% kableExtra::kable()
+```
+
+```{r}
+dat.clust.sum <- dat %>%
+  filter(year > 1999) %>% 
+  group_by(country, country.code, income.group) %>% 
+  #eliminados por concepto
+  select(-gghed_gdp, -gfa_che, -chi_che, -gghed_phc_phc,
+  #eliminados por NAs
+         -tran_shi, -phc_che, -gghed_phc_gghed, 
+         -SH.MED.CMHW.P3, 
+         -SH.UHC.OOPC.10.ZS, -SH.UHC.OOPC.25.ZS, 
+         -SH.SGR.CRSK.ZS, -SH.SGR.IRSK.ZS
+         ) %>% 
+  ungroup() %>% 
+  #eliminar variables colineales
+  select(-SH.XPD.GHED.CH.ZS, 
+         -gghe_gge, -gghe_gdp,
+         -SH.XPD.PVTD.CH.ZS,
+         -SH.XPD.CHEX.GD.ZS, -SH.XPD.OOPC.CH.ZS,
+         -cfa_che, -gghed_che,
+         -`Gasto de bolsillo`, -`Gasto con recursos externos`
+         ) %>% 
+  #eliminar países con NA en cobertura
+  filter(country.code %in% c("ARG", "BLZ", "BOL", "BRA", "CHL", "COL", 
+                             "CRI", "CUB", "DOM", "ECU", "GTM", "HND", 
+                             "HTI", "MEX", "NIC", "PAN", "PER", "PRY", 
+                             "SLV", "URY"))
+ 
+
+label(dat.clust.sum$year) <- "Año"
+label(dat.clust.sum$che_gdp) <- "Gasto sanitario corriente (% del PIB)"
+label(dat.clust.sum$pvtd_che) <- "Gasto sanitario del sector privado nacional (% del gasto sanitario corriente)"
+label(dat.clust.sum$oops_che) <- "Gasto directo (% del gasto sanitario corriente)"
+label(dat.clust.sum$SH.MED.BEDS.ZS) <- "Camas hospitalarias (por cada 1.000 personas)"
+label(dat.clust.sum$SH.MED.PHYS.ZS) <- "Médicos (por cada 1.000 personas)"
+label(dat.clust.sum$SH.MED.NUMW.P3) <- "Enfermeras y parteras (por cada 1.000 personas)"
+label(dat.clust.sum$SH.XPD.CHEX.PC.CD) <- "Gasto sanitario corriente per capita (US$ corriente)"
+label(dat.clust.sum$SH.XPD.GHED.GD.ZS) <- "Gasto sanitario del gobierno general (% del PIB)"
+label(dat.clust.sum$SH.XPD.GHED.GE.ZS) <- "Gasto sanitario del gobierno general (% del gasto del gobierno general)"
+label(dat.clust.sum$SH.XPD.EHEX.CH.ZS) <- "Gasto sanitario externo (% del gasto sanitario corriente)"
+label(dat.clust.sum$coverage) <- "Cotizantes a sistemas de salud (% de ocupados 15 años y más)"
+
+table1(~ coverage + che_gdp + pvtd_che + oops_che + 
+         SH.XPD.GHED.GD.ZS + SH.XPD.GHED.GE.ZS +
+         SH.MED.BEDS.ZS + SH.MED.PHYS.ZS + SH.MED.NUMW.P3 +
+         SH.XPD.CHEX.PC.CD + SH.XPD.EHEX.CH.ZS +
+         `Aporte fiscal` + `Seguridad social` + `Seguros privados` | country.code, 
+       data = dat.clust.sum) %>% t1flex()
+# summary(dat.clust.sum)
+```
+
+
+```{r}
+dat.clust <- dat %>%
+  filter(year > 1999) %>% 
+  group_by(country, country.code, income.group) %>% 
+  summarise(across(.cols = where(is.numeric), 
+                   list(~ mean(.x, na.rm = TRUE) ),
+                   .names = "{.col}" ) ) %>% 
+  #eliminados por concepto
+  select(-gghed_gdp, -gfa_che, -chi_che, -gghed_phc_phc,
+  #eliminados por NAs
+         -tran_shi, -phc_che, -gghed_phc_gghed, 
+         -SH.MED.CMHW.P3, 
+         -SH.UHC.OOPC.10.ZS, -SH.UHC.OOPC.25.ZS, 
+         -SH.SGR.CRSK.ZS, -SH.SGR.IRSK.ZS
+         ) %>% 
+  ungroup() %>% 
+  #eliminar variables colineales
+  select(-SH.XPD.GHED.CH.ZS, 
+         -gghe_gge, -gghe_gdp,
+         -SH.XPD.PVTD.CH.ZS,
+         -SH.XPD.CHEX.GD.ZS, -SH.XPD.OOPC.CH.ZS,
+         -cfa_che, -gghed_che,
+         -`Gasto de bolsillo`, -`Gasto con recursos externos`
+         ) %>% 
+  #eliminar países con NA en cobertura
+  filter(country.code %in% c("ARG", "BLZ", "BOL", "BRA", "CHL", "COL", 
+                             "CRI", "CUB", "DOM", "ECU", "GTM", "HND", 
+                             "HTI", "MEX", "NIC", "PAN", "PER", "PRY", 
+                             "SLV", "URY"))
+  
+# summary(dat.clust)
+```
+
+```{r resumen vars mean sd}
+dat.clust %>% 
+  summarise(across(.cols = where(is.numeric) & !year, 
+                   list(~ mean(.x, na.rm = TRUE), 
+                        ~ sd(.x, na.rm = TRUE) ),
+                   .names = "{.col}.fn{.fn}" ) ) %>% 
+  pivot_longer(everything(), names_to = "var") %>%
+  separate(col = "var", into = c("var", "stat"), sep = ".fn") %>% 
+  mutate(stat = ifelse(stat == 1, "Mean", "SD")) %>% 
+  pivot_wider(id_cols = c(var), names_from = stat, values_from = value) %>% 
+  mutate(`Mean (SD)` = paste0(round(Mean, 2), " (", round(SD, 2), ")")) %>% 
+  select(-Mean, -SD) %>% 
+  kableExtra::kable()
+```
+
+```{r separar datos y etiquetas sin cobertura}
+dat.clust1 <- dat.clust %>% select(-coverage) %>% na.omit() 
+
+dat.clust1.id <- dat.clust1[, c("country", "country.code", "income.group", "year")]
+
+dat.clust1.vars <- as.data.frame(scale(dat.clust1 %>% 
+                                        select(-country, -country.code, -income.group, -year) ))
+```
+
+```{r separar datos y etiquetas con cobertura}
+dat.clust2 <- dat.clust %>% na.omit() 
+
+dat.clust2.id <- dat.clust2[, c("country", "country.code", "income.group", "year")]
+
+dat.clust2.vars <- as.data.frame(scale(dat.clust2 %>% 
+                                        select(-country, -country.code, -income.group, -year) ))
+```
+
+**Datos sin cobertura**:   
+
+
+```{r fig.width=14, fig.height=10}
+corrplot::corrplot(cor(dat.clust1.vars), method = "ellipse", type = "upper", diag = T)
+corrplot::corrplot(cor(dat.clust1.vars), method = "number", type = "lower", diag = T, add = T)
+```
+
+**Datos con cobertura**:   
+
+```{r fig.width=14, fig.height=10}
+corrplot::corrplot(cor(dat.clust2.vars), method = "ellipse", type = "upper", diag = T)
+corrplot::corrplot(cor(dat.clust2.vars), method = "number", type = "lower", diag = T, add = T)
+```
+
+# Clustering
+
+**Algoritmos de agrupamiento**: Solamente trabajaremos con el algoritmo "ward.D2" para mantener consistencia con resultados anteriores. 
+
+
+**Distancia**: euclideana
+
+
+## Número óptimo de clusters jerárquicos
+
+**Sin cobertura**:  
+
+```{r hc sin cobertura}
+dists1 <- dist(dat.clust1.vars, method = "euclidean")
+
+hclusts1 <- hclust(dists1, method = "ward.D2")
+
+fviz_nbclust(dat.clust2.vars, FUN = hcut, method = "silhouette")
+```
+
+**Con cobertura**:  
+
+```{r hc con cobertura}
+dists2 <- dist(dat.clust2.vars, method = "euclidean")
+
+hclusts2 <- hclust(dists2, method = "ward.D2")
+
+fviz_nbclust(dat.clust2.vars, FUN = hcut, method = "silhouette") -> sil
+
+sil
+
+sil$data
+
+```
+
+El número óptimo de clusters con y sin la variable de cobertura es k=6. En segundo lugar está k=2.
+
+# Resultados
+
+```{r eval=F, include=F}
+par(mfrow = c(1, 2))
+  plot(hclusts1)
+  plot(hclusts2)
+```
+
+## Resultados k = 2
+
+### k = 2 sin cobertura
+
+```{r clusters k2 sin cobertura, fig.width=6, fig.height=6}
+hclusts1$labels <- dat.clust1$country.code
+
+dend_k2 <- hclusts1 %>% 
+  as.dendrogram() %>% 
+  set("branches_k_color", k = 2) %>%
+ # set("labels_colors", dat.clust2$country.code) %>% 
+  set("labels_cex", c(.5)) %>% 
+  as.ggdend()
+
+ggplot(dend_k2, horiz = T, offset_labels = -.2, theme = NULL) + 
+  theme_minimal() +
+  labs(x = "", y = "Distancia") + 
+  theme(axis.title.y = element_blank(),
+        axis.text.y = element_blank(),
+        axis.ticks.y = element_blank())
+```
+
+```{r tablas k2 sin cobertura}
+dat.clust1$clusters_k2 <- as.factor(cutree(hclusts1, k = 2))
+
+label(dat.clust1$year) <- "Año"
+label(dat.clust1$che_gdp) <- "Gasto sanitario corriente (% del PIB)"
+label(dat.clust1$pvtd_che) <- "Gasto sanitario del sector privado nacional (% del gasto sanitario corriente)"
+label(dat.clust1$oops_che) <- "Gasto directo (% del gasto sanitario corriente)"
+label(dat.clust1$SH.MED.BEDS.ZS) <- "Camas hospitalarias (por cada 1.000 personas)"
+label(dat.clust1$SH.MED.PHYS.ZS) <- "Médicos (por cada 1.000 personas)"
+label(dat.clust1$SH.MED.NUMW.P3) <- "Enfermeras y parteras (por cada 1.000 personas)"
+label(dat.clust1$SH.XPD.CHEX.PC.CD) <- "Gasto sanitario corriente per capita (US$ corriente)"
+label(dat.clust1$SH.XPD.GHED.GD.ZS) <- "Gasto sanitario del gobierno general (% del PIB)"
+label(dat.clust1$SH.XPD.GHED.GE.ZS) <- "Gasto sanitario del gobierno general (% del gasto del gobierno general)"
+label(dat.clust1$SH.XPD.EHEX.CH.ZS) <- "Gasto sanitario externo (% del gasto sanitario corriente)"
+
+table1(~ income.group + che_gdp + pvtd_che + oops_che + 
+         SH.XPD.GHED.GD.ZS + SH.XPD.GHED.GE.ZS +
+         SH.MED.BEDS.ZS + SH.MED.PHYS.ZS + SH.MED.NUMW.P3 +
+         SH.XPD.CHEX.PC.CD + SH.XPD.EHEX.CH.ZS +
+         `Aporte fiscal` + `Seguridad social` + `Seguros privados` | clusters_k2, 
+       data = dat.clust1, overall = F) %>% t1flex()
+
+```
+
+```{r boxplots k2 sin cobertura, fig.height=8, fig.width=8}
+baseplot <- ggplot(dat.clust1, aes(x = clusters_k2, color = clusters_k2)) + 
+  labs(x = "", color = "Conglomerados") +
+  theme_minimal() +
+  theme(axis.title = element_text(size = 6.5)) 
+
+ggarrange (
+  baseplot + geom_boxplot(aes(y = che_gdp)) + labs(y = "Gasto sanitario corriente\n(% del PIB)"),
+baseplot + geom_boxplot(aes(y = pvtd_che)) + labs(y = "Gasto sanitario del sector privado\nnacional (% gasto sanitario cte.)"),
+baseplot + geom_boxplot(aes(y = oops_che)) + labs(y = "Gasto directo\n(% del gasto sanitario corriente)"),
+baseplot + geom_boxplot(aes(y = SH.MED.BEDS.ZS)) + labs(y = "Camas hospitalarias\n(por cada 1.000 personas)"),
+baseplot + geom_boxplot(aes(y = SH.MED.PHYS.ZS)) + labs(y = "Médicos\n(por cada 1.000 personas)"),
+baseplot + geom_boxplot(aes(y = SH.MED.NUMW.P3)) + labs(y = "Enfermeras y parteras\n(por cada 1.000 personas)"),
+baseplot + geom_boxplot(aes(y = SH.XPD.CHEX.PC.CD)) + labs(y = "Gasto sanitario corriente per capita\n(US$ corriente)"),
+baseplot + geom_boxplot(aes(y = SH.XPD.GHED.GD.ZS)) + labs(y = "Gasto sanitario del gobierno general\n(% del PIB)"),
+baseplot + geom_boxplot(aes(y = SH.XPD.GHED.GE.ZS)) + labs(y = "Gasto sanitario del gobierno general\n(% del gasto del gobierno general)"),
+baseplot + geom_boxplot(aes(y = SH.XPD.EHEX.CH.ZS)) + labs(y = "Gasto sanitario externo\n(% del gasto sanitario corriente)"),
+baseplot + geom_boxplot(aes(y = `Aporte fiscal`)),
+baseplot + geom_boxplot(aes(y = `Seguridad social`)),
+baseplot + geom_boxplot(aes(y = `Seguros privados`)),
+common.legend = T, legend = "none"
+)
+
+```
+
+### k = 2 con cobertura
+
+```{r clusters k2 con cobertura, fig.width=6, fig.height=6}
+hclusts2$labels <- dat.clust2$country.code
+
+dend_k2 <- hclusts2 %>% 
+  as.dendrogram() %>% 
+  set("branches_k_color", k = 2) %>%
+ # set("labels_colors", dat.clust2$country.code) %>% 
+  set("labels_cex", c(.5)) %>% 
+  as.ggdend()
+
+ggplot(dend_k2, horiz = T, offset_labels = -.2, theme = NULL) + 
+  theme_minimal() +
+  labs(x = "", y = "Distancia") + 
+  theme(axis.title.y = element_blank(),
+        axis.text.y = element_blank(),
+        axis.ticks.y = element_blank())
+```
+
+```{r tablas k2 con cobertura}
+dat.clust2$clusters_k2 <- as.factor(cutree(hclusts2, k = 2))
+
+label(dat.clust2$year) <- "Año"
+label(dat.clust2$che_gdp) <- "Gasto sanitario corriente (% del PIB)"
+label(dat.clust2$pvtd_che) <- "Gasto sanitario del sector privado nacional (% del gasto sanitario corriente)"
+label(dat.clust2$oops_che) <- "Gasto directo (% del gasto sanitario corriente)"
+label(dat.clust2$SH.MED.BEDS.ZS) <- "Camas hospitalarias (por cada 1.000 personas)"
+label(dat.clust2$SH.MED.PHYS.ZS) <- "Médicos (por cada 1.000 personas)"
+label(dat.clust2$SH.MED.NUMW.P3) <- "Enfermeras y parteras (por cada 1.000 personas)"
+label(dat.clust2$SH.XPD.CHEX.PC.CD) <- "Gasto sanitario corriente per capita (US$ corriente)"
+label(dat.clust2$SH.XPD.GHED.GD.ZS) <- "Gasto sanitario del gobierno general (% del PIB)"
+label(dat.clust2$SH.XPD.GHED.GE.ZS) <- "Gasto sanitario del gobierno general (% del gasto del gobierno general)"
+label(dat.clust2$SH.XPD.EHEX.CH.ZS) <- "Gasto sanitario externo (% del gasto sanitario corriente)"
+label(dat.clust2$coverage) <- "Cotizantes a sistemas de salud (% de ocupados 15 años y más)"
+
+table1(~ income.group + coverage + che_gdp + pvtd_che + oops_che + 
+         SH.XPD.GHED.GD.ZS + SH.XPD.GHED.GE.ZS +
+         SH.MED.BEDS.ZS + SH.MED.PHYS.ZS + SH.MED.NUMW.P3 +
+         SH.XPD.CHEX.PC.CD + SH.XPD.EHEX.CH.ZS +
+         `Aporte fiscal` + `Seguridad social` + `Seguros privados`| clusters_k2, 
+       data = dat.clust2, overall = F) %>% t1flex()
+
+```
+
+```{r boxplots k2 con cobertura, fig.height=8, fig.width=8}
+baseplot <- ggplot(dat.clust2, aes(x = clusters_k2, color = clusters_k2)) + 
+  labs(x = "", color = "Conglomerados") +
+  theme_minimal() +
+  theme(axis.title = element_text(size = 6.5)) 
+
+ggarrange (
+  baseplot + geom_boxplot(aes(y = che_gdp)) + labs(y = "Gasto sanitario corriente\n(% del PIB)"),
+baseplot + geom_boxplot(aes(y = pvtd_che)) + labs(y = "Gasto sanitario del sector privado\nnacional (% gasto sanitario cte.)"),
+baseplot + geom_boxplot(aes(y = oops_che)) + labs(y = "Gasto directo\n(% del gasto sanitario corriente)"),
+baseplot + geom_boxplot(aes(y = SH.MED.BEDS.ZS)) + labs(y = "Camas hospitalarias\n(por cada 1.000 personas)"),
+baseplot + geom_boxplot(aes(y = SH.MED.PHYS.ZS)) + labs(y = "Médicos\n(por cada 1.000 personas)"),
+baseplot + geom_boxplot(aes(y = SH.MED.NUMW.P3)) + labs(y = "Enfermeras y parteras\n(por cada 1.000 personas)"),
+baseplot + geom_boxplot(aes(y = SH.XPD.CHEX.PC.CD)) + labs(y = "Gasto sanitario corriente per capita\n(US$ corriente)"),
+baseplot + geom_boxplot(aes(y = SH.XPD.GHED.GD.ZS)) + labs(y = "Gasto sanitario del gobierno general\n(% del PIB)"),
+baseplot + geom_boxplot(aes(y = SH.XPD.GHED.GE.ZS)) + labs(y = "Gasto sanitario del gobierno general\n(% del gasto del gobierno general)"),
+baseplot + geom_boxplot(aes(y = SH.XPD.EHEX.CH.ZS)) + labs(y = "Gasto sanitario externo\n(% del gasto sanitario corriente)"),
+baseplot + geom_boxplot(aes(y = coverage)) + labs(y = "Cotizantes a sistemas de salud\n(% de ocupados 15 años y más)"),
+baseplot + geom_boxplot(aes(y = `Aporte fiscal`)),
+baseplot + geom_boxplot(aes(y = `Seguridad social`)),
+baseplot + geom_boxplot(aes(y = `Seguros privados`)),
+common.legend = T, legend = "none"
+)
+
+```
+
+## Resultados k = 6
+
+### k = 6 sin cobertura
+
+```{r clusters k6 sin cobertura, fig.width=6, fig.height=6}
+hclusts1$labels <- dat.clust1$country.code
+
+dend_k6 <- hclusts1 %>% 
+  as.dendrogram() %>% 
+  set("branches_k_color", k = 6) %>%
+ # set("labels_colors", dat.clust2$country.code) %>% 
+  set("labels_cex", c(.5)) %>% 
+  as.ggdend()
+
+ggplot(dend_k6, horiz = T, offset_labels = -.2, theme = NULL) + 
+  theme_minimal() +
+  labs(x = "", y = "Distancia") + 
+  theme(axis.title.y = element_blank(),
+        axis.text.y = element_blank(),
+        axis.ticks.y = element_blank())
+```
+
+```{r tablas k6 sin cobertura}
+dat.clust1$clusters_k6 <- as.factor(cutree(hclusts1, k = 6))
+
+label(dat.clust1$year) <- "Año"
+label(dat.clust1$che_gdp) <- "Gasto sanitario corriente (% del PIB)"
+label(dat.clust1$pvtd_che) <- "Gasto sanitario del sector privado nacional (% del gasto sanitario corriente)"
+label(dat.clust1$oops_che) <- "Gasto directo (% del gasto sanitario corriente)"
+label(dat.clust1$SH.MED.BEDS.ZS) <- "Camas hospitalarias (por cada 1.000 personas)"
+label(dat.clust1$SH.MED.PHYS.ZS) <- "Médicos (por cada 1.000 personas)"
+label(dat.clust1$SH.MED.NUMW.P3) <- "Enfermeras y parteras (por cada 1.000 personas)"
+label(dat.clust1$SH.XPD.CHEX.PC.CD) <- "Gasto sanitario corriente per capita (US$ corriente)"
+label(dat.clust1$SH.XPD.GHED.GD.ZS) <- "Gasto sanitario del gobierno general (% del PIB)"
+label(dat.clust1$SH.XPD.GHED.GE.ZS) <- "Gasto sanitario del gobierno general (% del gasto del gobierno general)"
+label(dat.clust1$SH.XPD.EHEX.CH.ZS) <- "Gasto sanitario externo (% del gasto sanitario corriente)"
+
+table1(~ income.group + che_gdp + pvtd_che + oops_che + 
+         SH.XPD.GHED.GD.ZS + SH.XPD.GHED.GE.ZS +
+         SH.MED.BEDS.ZS + SH.MED.PHYS.ZS + SH.MED.NUMW.P3 +
+         SH.XPD.CHEX.PC.CD + SH.XPD.EHEX.CH.ZS +
+         `Aporte fiscal` + `Seguridad social` + `Seguros privados`| clusters_k6, 
+       data = dat.clust1, overall = F) %>% t1flex()
+
+```
+
+```{r boxplots k6 sin cobertura, fig.height=8, fig.width=8}
+baseplot <- ggplot(dat.clust1, aes(x = clusters_k6, color = clusters_k6)) + 
+  labs(x = "", color = "Conglomerados") +
+  theme_minimal() +
+  theme(axis.title = element_text(size = 6.5)) 
+
+ggarrange (
+  baseplot + geom_boxplot(aes(y = che_gdp)) + labs(y = "Gasto sanitario corriente\n(% del PIB)"),
+baseplot + geom_boxplot(aes(y = pvtd_che)) + labs(y = "Gasto sanitario del sector privado\nnacional (% gasto sanitario cte.)"),
+baseplot + geom_boxplot(aes(y = oops_che)) + labs(y = "Gasto directo\n(% del gasto sanitario corriente)"),
+baseplot + geom_boxplot(aes(y = SH.MED.BEDS.ZS)) + labs(y = "Camas hospitalarias\n(por cada 1.000 personas)"),
+baseplot + geom_boxplot(aes(y = SH.MED.PHYS.ZS)) + labs(y = "Médicos\n(por cada 1.000 personas)"),
+baseplot + geom_boxplot(aes(y = SH.MED.NUMW.P3)) + labs(y = "Enfermeras y parteras\n(por cada 1.000 personas)"),
+baseplot + geom_boxplot(aes(y = SH.XPD.CHEX.PC.CD)) + labs(y = "Gasto sanitario corriente per capita\n(US$ corriente)"),
+baseplot + geom_boxplot(aes(y = SH.XPD.GHED.GD.ZS)) + labs(y = "Gasto sanitario del gobierno general\n(% del PIB)"),
+baseplot + geom_boxplot(aes(y = SH.XPD.GHED.GE.ZS)) + labs(y = "Gasto sanitario del gobierno general\n(% del gasto del gobierno general)"),
+baseplot + geom_boxplot(aes(y = SH.XPD.EHEX.CH.ZS)) + labs(y = "Gasto sanitario externo\n(% del gasto sanitario corriente)"),
+baseplot + geom_boxplot(aes(y = `Aporte fiscal`)),
+baseplot + geom_boxplot(aes(y = `Seguridad social`)),
+baseplot + geom_boxplot(aes(y = `Seguros privados`)),
+common.legend = T, legend = "none"
+)
+
+```
+
+### k = 6 con cobertura
+
+```{r clusters k6 con cobertura, fig.width=6, fig.height=6}
+hclusts2$labels <- dat.clust2$country.code
+
+dend_k6 <- hclusts2 %>% 
+  as.dendrogram() %>% 
+  set("branches_k_color", k = 6) %>%
+ # set("labels_colors", dat.clust2$country.code) %>% 
+  set("labels_cex", c(.5)) %>% 
+  as.ggdend()
+
+ggplot(dend_k6, horiz = T, offset_labels = -.2, theme = NULL) + 
+  theme_minimal() +
+  labs(x = "", y = "Distancia") + 
+  theme(axis.title.y = element_blank(),
+        axis.text.y = element_blank(),
+        axis.ticks.y = element_blank())
+```
+
+```{r tablas k6 con cobertura}
+dat.clust2$clusters_k6 <- as.factor(cutree(hclusts2, k = 6))
+
+label(dat.clust2$year) <- "Año"
+label(dat.clust2$che_gdp) <- "Gasto sanitario corriente (% del PIB)"
+label(dat.clust2$pvtd_che) <- "Gasto sanitario del sector privado nacional (% del gasto sanitario corriente)"
+label(dat.clust2$oops_che) <- "Gasto directo (% del gasto sanitario corriente)"
+label(dat.clust2$SH.MED.BEDS.ZS) <- "Camas hospitalarias (por cada 1.000 personas)"
+label(dat.clust2$SH.MED.PHYS.ZS) <- "Médicos (por cada 1.000 personas)"
+label(dat.clust2$SH.MED.NUMW.P3) <- "Enfermeras y parteras (por cada 1.000 personas)"
+label(dat.clust2$SH.XPD.CHEX.PC.CD) <- "Gasto sanitario corriente per capita (US$ corriente)"
+label(dat.clust2$SH.XPD.GHED.GD.ZS) <- "Gasto sanitario del gobierno general (% del PIB)"
+label(dat.clust2$SH.XPD.GHED.GE.ZS) <- "Gasto sanitario del gobierno general (% del gasto del gobierno general)"
+label(dat.clust2$SH.XPD.EHEX.CH.ZS) <- "Gasto sanitario externo (% del gasto sanitario corriente)"
+label(dat.clust2$coverage) <- "Cotizantes a sistemas de salud (% de ocupados 15 años y más)"
+
+table1(~ income.group + coverage + che_gdp + pvtd_che + oops_che + 
+         SH.XPD.GHED.GD.ZS + SH.XPD.GHED.GE.ZS +
+         SH.MED.BEDS.ZS + SH.MED.PHYS.ZS + SH.MED.NUMW.P3 +
+         SH.XPD.CHEX.PC.CD + SH.XPD.EHEX.CH.ZS +
+         `Aporte fiscal` + `Seguridad social` + `Seguros privados`| clusters_k6, 
+       data = dat.clust2, overall = F) %>% t1flex()
+
+```
+
+```{r boxplots k6 con cobertura, fig.height=8, fig.width=8}
+baseplot <- ggplot(dat.clust2, aes(x = clusters_k6, color = clusters_k6)) + 
+  labs(x = "", color = "Conglomerados") +
+  theme_minimal() +
+  theme(axis.title = element_text(size = 6.5)) 
+
+ggarrange (
+  baseplot + geom_boxplot(aes(y = che_gdp)) + labs(y = "Gasto sanitario corriente\n(% del PIB)"),
+baseplot + geom_boxplot(aes(y = pvtd_che)) + labs(y = "Gasto sanitario del sector privado\nnacional (% gasto sanitario cte.)"),
+baseplot + geom_boxplot(aes(y = oops_che)) + labs(y = "Gasto directo\n(% del gasto sanitario corriente)"),
+baseplot + geom_boxplot(aes(y = SH.MED.BEDS.ZS)) + labs(y = "Camas hospitalarias\n(por cada 1.000 personas)"),
+baseplot + geom_boxplot(aes(y = SH.MED.PHYS.ZS)) + labs(y = "Médicos\n(por cada 1.000 personas)"),
+baseplot + geom_boxplot(aes(y = SH.MED.NUMW.P3)) + labs(y = "Enfermeras y parteras\n(por cada 1.000 personas)"),
+baseplot + geom_boxplot(aes(y = SH.XPD.CHEX.PC.CD)) + labs(y = "Gasto sanitario corriente per capita\n(US$ corriente)"),
+baseplot + geom_boxplot(aes(y = SH.XPD.GHED.GD.ZS)) + labs(y = "Gasto sanitario del gobierno general\n(% del PIB)"),
+baseplot + geom_boxplot(aes(y = SH.XPD.GHED.GE.ZS)) + labs(y = "Gasto sanitario del gobierno general\n(% del gasto del gobierno general)"),
+baseplot + geom_boxplot(aes(y = SH.XPD.EHEX.CH.ZS)) + labs(y = "Gasto sanitario externo\n(% del gasto sanitario corriente)"),
+baseplot + geom_boxplot(aes(y = coverage)) + labs(y = "Cotizantes a sistemas de salud\n(% de ocupados 15 años y más)"),
+baseplot + geom_boxplot(aes(y = `Aporte fiscal`)),
+baseplot + geom_boxplot(aes(y = `Seguridad social`)),
+baseplot + geom_boxplot(aes(y = `Seguros privados`)),
+common.legend = T, legend = "none"
+)
+
+```
+
+
+## Países por cluster
+
+### Sin cobertura
+```{r}
+dat.clust1 %>% 
+  select(country, country.code, clusters_k2, clusters_k6) %>% unique %>% kableExtra::kable()
+```
+
+### Con cobertura
+```{r}
+dat.clust2 %>% 
+  select(country, country.code, clusters_k2, clusters_k6) %>% unique %>% kableExtra::kable()
+```
+
